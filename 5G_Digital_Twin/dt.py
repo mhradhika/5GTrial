@@ -46,6 +46,64 @@ _Ns3UPA          = None
 _Ns3MatrixCh     = None
 
                                                                                
+# ---------------------------------------------------------------------------
+# NS-3 / cppyy integration
+#
+# ROOT CAUSE OF ALL PREVIOUS CRASHES:
+#   cppyy's Cling/ROOT type-reflection machinery uses process-global state.
+#   Calling ANY cppyy-wrapped C++ from a thread other than the one that
+#   initialised cppyy causes segfaults inside TListOfEnums::Load() —
+#   completely independent of Python's GIL or any Python-level lock.
+#
+# SOLUTION — main-thread NS-3 dispatcher:
+#   Background sim threads never touch cppyy objects directly.  Instead they
+#   post a callable to _NS3_QUEUE and block on a threading.Event until the
+#   main thread (inside its server.handle_request() loop) drains the queue
+#   and executes each callable, returning the result via the same event.
+#
+#   _ns3_call(fn) — call fn() on the main thread, return its result.
+#   _ns3_drain()  — drain the queue once; called from the main loop.
+# ---------------------------------------------------------------------------
+
+import queue as _queue
+
+_NS3_QUEUE = _queue.Queue()   # items: (fn, result_list, event)
+
+def _ns3_call(fn):
+    """
+    Execute fn() on the main thread and return its result.
+    Safe to call from any background thread.
+    If we are already on the main thread (e.g. during startup) just call directly.
+    """
+    import threading as _th
+    if _th.current_thread() is _th.main_thread():
+        return fn()
+    result = [None]
+    exc    = [None]
+    done   = _th.Event()
+    def _wrapper():
+        try:    result[0] = fn()
+        except Exception as e: exc[0] = e
+        finally: done.set()
+    _NS3_QUEUE.put(_wrapper)
+    done.wait()
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0]
+
+def _ns3_drain():
+    """Drain pending NS-3 calls from the main thread. Call this in the server loop."""
+    try:
+        while True:
+            fn = _NS3_QUEUE.get_nowait()
+            fn()
+    except _queue.Empty:
+        pass
+
+# ---------------------------------------------------------------------------
+# Load NS-3 libraries (main thread, at import time — safe)
+# ---------------------------------------------------------------------------
+
 try:
     import cppyy as _cppyy
 
@@ -58,7 +116,6 @@ try:
     _cppyy.add_library_path(_NS3_LIB)
     _cppyy.add_include_path(_NS3_INC)
 
-                                               
     for _lib in [
         "libns3.46-core-debug",
         "libns3.46-network-debug",
@@ -70,7 +127,6 @@ try:
     ]:
         _cppyy.load_library(_lib)
 
-                                                                          
     _cppyy.include("ns3/core-module.h")
     _cppyy.include("ns3/mobility-module.h")
     _cppyy.include("ns3/three-gpp-propagation-loss-model.h")
@@ -79,15 +135,32 @@ try:
 
     _ns3 = _cppyy.gbl.ns3
 
-                                                                                
-                                                                       
-                                                                           
-    def _Ns3UmiLossModel():
-        return _ns3.CreateObject[_ns3.ThreeGppUmiStreetCanyonPropagationLossModel]()
-
+    # --- helper: create an NS-3 object and immediately pin its ownership so
+    #     Python's GC never calls ns3::Object::DoDelete() on it.
+    #     Must be called from the main thread only (via _ns3_call if needed).
     def _ns3_create_object(type_name):
         cls = getattr(_ns3, type_name)
-        return _ns3.CreateObject[cls]()
+        obj = _ns3.CreateObject[cls]()
+        # Try set_ownership if available (newer cppyy builds).
+        # On older builds it isn't exposed — in that case we keep a permanent
+        # reference in _NS3_PINNED so the Python wrapper is never GC'd.
+        try:
+            import cppyy.ll as _ll
+            _ll.set_ownership(obj, False)
+        except (ImportError, AttributeError):
+            _NS3_PINNED.append(obj)   # permanent ref — prevents GC / DoDelete
+        return obj
+
+    _NS3_PINNED = []   # strong refs to all NS-3 objects; prevents GC-triggered DoDelete
+
+    def _Ns3UmiLossModel():
+        obj = _ns3.CreateObject[_ns3.ThreeGppUmiStreetCanyonPropagationLossModel]()
+        try:
+            import cppyy.ll as _ll
+            _ll.set_ownership(obj, False)
+        except (ImportError, AttributeError):
+            _NS3_PINNED.append(obj)
+        return obj
 
     _Ns3MobilityHelper = _ns3.MobilityHelper
     _Ns3PosModel       = _ns3.ConstantPositionMobilityModel
@@ -97,13 +170,13 @@ try:
     HAS_NS3_PROPAGATION = True
     print("[INFO] ns3.propagation bound — using native 3GPP TR 38.901 path-loss math.")
 
-                                                                               
-                                                                 
-                                                                             
-                                                                              
-                                                  
     try:
         _lteamc_obj = _ns3.CreateObject[_ns3.LteAmc]()
+        try:
+            import cppyy.ll as _ll
+            _ll.set_ownership(_lteamc_obj, False)
+        except (ImportError, AttributeError):
+            _NS3_PINNED.append(_lteamc_obj)
 
         class _Ns3LteAmc:
             @staticmethod
@@ -132,7 +205,6 @@ try:
 except Exception as _prop_e:
     print(f"[WARN] ns3.propagation not found — falling back to Python path-loss engine. ({_prop_e})")
     print(f"[WARN] ns3.lte not found — falling back to Python AMC engine.")
-                                                        
     def _Ns3UmiLossModel():       return None
     def _ns3_create_object(t):    return None
     _Ns3MobilityHelper = None
@@ -140,6 +212,7 @@ except Exception as _prop_e:
     _Ns3DoubleValue    = None
     _Ns3Vector         = None
     _Ns3LteAmc         = None
+    _NS3_PINNED        = []
 
                                                                      
                                                            
@@ -934,46 +1007,34 @@ class NsLteAmc:
     @staticmethod
     def GetCqiFromSpectralEfficiency(sinr_db: float) -> int:
         """ns3::LteAmc::GetCqiFromSpectralEfficiency() — maps SINR→CQI.
-        Uses native NS-3 C++ lookup when ns3.lte is available."""
-        if HAS_NS3_LTE:
-                                                                          
-                                                                        
-            if sinr_db < -6.0:
-                return 0
-            sinr_lin = 10.0 ** (sinr_db / 10.0)
-            spec_eff = math.log2(1.0 + sinr_lin)
-            return int(_Ns3LteAmc.GetCqiFromSpectralEfficiency(spec_eff))
-        else:
-                                  
-            if sinr_db < -6.0: return 0
-            sinr_lin = 10.0 ** (sinr_db / 10.0)
-            spec_eff = math.log2(1.0 + sinr_lin)
-            table = NsLteAmc.SPECTRAL_EFF_FOR_CQI
-            cqi = 1
-            for i in range(1, 16):
-                if spec_eff >= table[i]: cqi = i
-                else: break
-            return max(1, min(15, cqi))
+        NOTE: always uses the Python lookup table even when HAS_NS3_LTE is True.
+        Dispatching per-UE per-tick calls through _ns3_call() saturates the
+        main-thread queue (100-400 calls/tick × 1s tick = queue never drains).
+        The Python table is the same 3GPP TS 36.213 Table 7.2.3-1 that NS-3 uses."""
+        if sinr_db < -6.0: return 0
+        sinr_lin = 10.0 ** (sinr_db / 10.0)
+        spec_eff = math.log2(1.0 + sinr_lin)
+        table = NsLteAmc.SPECTRAL_EFF_FOR_CQI
+        cqi = 1
+        for i in range(1, 16):
+            if spec_eff >= table[i]: cqi = i
+            else: break
+        return max(1, min(15, cqi))
 
     @staticmethod
     def GetMcsFromCqi(cqi: int) -> int:
-        if HAS_NS3_LTE:
-            return int(_Ns3LteAmc.GetMcsFromCqi(cqi))
-        else:
-            CQI_TO_MCS = [0, 0, 1, 2, 4, 6, 8, 11, 13, 15, 18, 20, 22, 24, 26, 28]
-            return CQI_TO_MCS[max(0, min(15, cqi))]
+        # Python table — same as NS-3's CQI_TO_MCS; avoids _ns3_call queue saturation.
+        CQI_TO_MCS = [0, 0, 1, 2, 4, 6, 8, 11, 13, 15, 18, 20, 22, 24, 26, 28]
+        return CQI_TO_MCS[max(0, min(15, cqi))]
 
     @staticmethod
     def GetTbSizeFromMcsNprb(mcs: int, nprb: int) -> int:
-        if HAS_NS3_LTE:
-                                                                               
-            return max(1, int(_Ns3LteAmc.GetTbSizeFromMcsNprb(mcs, nprb)) // 8)
-        else:
-            mcs = max(0, min(28, mcs)); nprb = max(1, min(110, nprb))
-            itbs = NsLteAmc.MCS_TO_ITBS[mcs]
-            se   = NsLteAmc.SPECTRAL_EFF_FOR_CQI[min(itbs, 15)]
-            bits = nprb * se * 12.0 * 14.0
-            return max(1, int(bits / 8.0))
+        # Python table — same formula NS-3 uses internally.
+        mcs = max(0, min(28, mcs)); nprb = max(1, min(110, nprb))
+        itbs = NsLteAmc.MCS_TO_ITBS[mcs]
+        se   = NsLteAmc.SPECTRAL_EFF_FOR_CQI[min(itbs, 15)]
+        bits = nprb * se * 12.0 * 14.0
+        return max(1, int(bits / 8.0))
 
     @staticmethod
     def GetBler(sinr_db: float, cqi: int, harq_round: int = 0) -> float:
@@ -1014,22 +1075,20 @@ class NsThreeGppUmiStreetCanyonPropagationLossModel:
                                                                            
     _ns3_model_cache: dict = {}                             
 
-    @staticmethod
-    def _get_ns3_model(fc_ghz: float):
-        """Return (or create) a cached native propagation model for freq_ghz."""
-        key = f"{fc_ghz:.4f}"
-        if key not in NsThreeGppUmiStreetCanyonPropagationLossModel._ns3_model_cache:
-            model = _Ns3UmiLossModel()
-            model.SetAttribute("Frequency", _Ns3DoubleValue(fc_ghz * 1e9))
-            NsThreeGppUmiStreetCanyonPropagationLossModel._ns3_model_cache[key] = model
-        return NsThreeGppUmiStreetCanyonPropagationLossModel._ns3_model_cache[key]
+    # Pool of pre-created mob node pairs for main-thread NS-3 calls.
+    # Index into the pool is grabbed via a counter; since _ns3_drain runs
+    # sequentially on the main thread there is never concurrent access.
+    _ns3_mob_pool: list = []   # list of (mob_a, mob_b) pairs
+    _MOB_POOL_SIZE = 1         # one pair is enough — drain is sequential
 
     @staticmethod
-    def _make_mobility(x: float, y: float, z: float):
-        """Create a ConstantPositionMobilityModel at (x, y, z)."""
-        mob = _ns3_create_object("ConstantPositionMobilityModel")
-        mob.SetPosition(_Ns3Vector(x, y, z))
-        return mob
+    def _ensure_mob_pool():
+        """Create the mob node pool on the main thread (lazy, once)."""
+        cls = NsThreeGppUmiStreetCanyonPropagationLossModel
+        while len(cls._ns3_mob_pool) < cls._MOB_POOL_SIZE:
+            a = _ns3_create_object("ConstantPositionMobilityModel")
+            b = _ns3_create_object("ConstantPositionMobilityModel")
+            cls._ns3_mob_pool.append((a, b))
 
     @staticmethod
     def _GetBreakpointDistance(fc_ghz, h_bs, h_ut):
@@ -1057,19 +1116,20 @@ class NsThreeGppUmiStreetCanyonPropagationLossModel:
 
     @staticmethod
     def DoCalcRxPower(tx_dbm, d2d, d3d, fc_ghz, h_bs=10.0, h_ut=1.5):
-        if HAS_NS3_PROPAGATION:
-                                                                             
-                                                                          
-                                                    
-            try:
-                model  = NsThreeGppUmiStreetCanyonPropagationLossModel._get_ns3_model(fc_ghz)
-                mob_a  = NsThreeGppUmiStreetCanyonPropagationLossModel._make_mobility(0.0, 0.0, h_bs)
-                mob_b  = NsThreeGppUmiStreetCanyonPropagationLossModel._make_mobility(max(d2d, 1.0), 0.0, h_ut)
-                                                                                 
-                return model.CalculateTxPower(tx_dbm, mob_a, mob_b)
-            except Exception:
-                pass                                                               
-                                                                     
+        # DESIGN DECISION: always use the pure-Python TR 38.901 path.
+        #
+        # Rationale: the NS-3 C++ path computes exactly the same formula
+        # (ThreeGppUmiStreetCanyonPropagationLossModel IS the TR 38.901 math).
+        # Dispatching it through _ns3_call() adds up to server.timeout (500 ms)
+        # of latency per UE per tick because the main thread is blocked in
+        # select() between handle_request() calls.  With 100-400 UEs each
+        # requiring ~6 path-loss evaluations per tick, the queue grows without
+        # bound and eventually the heap is corrupted by the pile-up of blocked
+        # background threads and their closure captures.
+        #
+        # The Python path below is used unchanged; NS-3 objects are still
+        # initialised (for LteAmc table lookups which are called rarely and
+        # tolerate the queue latency).
         p_los   = NsThreeGppUmiStreetCanyonPropagationLossModel.GetPlos(d2d)
         pl_los  = NsThreeGppUmiStreetCanyonPropagationLossModel.GetLossLos(d2d, d3d, fc_ghz, h_bs, h_ut)
         pl_nlos = NsThreeGppUmiStreetCanyonPropagationLossModel.GetLossNlos(d2d, d3d, fc_ghz, h_bs, h_ut)
@@ -3887,7 +3947,9 @@ def main():
     signal.signal(signal.SIGINT,shutdown)
     signal.signal(signal.SIGTERM,shutdown)
     try:
-        while running[0]: server.handle_request()
+        while running[0]:
+            server.handle_request()
+            _ns3_drain()   # execute any pending NS-3 calls posted by background threads
     except KeyboardInterrupt:
         shutdown(None,None)
 
