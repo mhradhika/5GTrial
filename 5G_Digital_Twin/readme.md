@@ -32,7 +32,8 @@ The platform is structured into five layers:
 ---
 
 ##  Quick Start Instructions
-
+<video src="path/to/your/video.mp4" controls="controls" style="max-width: 100%;">
+</video>
 Follow these steps to get the dashboard running:
 
 ### 1. Clone the Repository
