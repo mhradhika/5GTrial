@@ -32,8 +32,10 @@ The platform is structured into five layers:
 ---
 
 ##  Quick Start Instructions
-<video src="https://github.com/mhradhika/5GTrial/raw/main/5G_Digital_Twin/GIT_VIDEO.mp4" muted autoplay loop style="max-width: 100%;">
-</video>
+### 📺 Project Demo
+video: [Download/View Video]()
+
+<video src="" width="100%" controls></video>
 Follow these steps to get the dashboard running:
 
 ### 1. Clone the Repository
