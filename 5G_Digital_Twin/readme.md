@@ -32,7 +32,7 @@ The platform is structured into five layers:
 ---
 
 ##  Quick Start Instructions
-<video src="path/to/your/video.mp4" controls="controls" style="max-width: 100%;">
+<video src="https://github.com/mhradhika/5GTrial/raw/main/5G_Digital_Twin/GIT_VIDEO.mp4" muted autoplay loop style="max-width: 100%;">
 </video>
 Follow these steps to get the dashboard running:
 
