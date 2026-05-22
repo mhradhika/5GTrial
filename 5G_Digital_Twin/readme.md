@@ -26,7 +26,7 @@ The platform is structured into five layers:
 # Installation & Setup
 ## Prerequisites
 * **Operating System**: Ubuntu 22.04 or later (recommended).
-* **Internet Connection**: Required to download ns-3 source files and system dependencies.
+* **Internet Connection**: 
 * **Sudo Access**: Required to install networking libraries.
 
 ---
@@ -37,14 +37,13 @@ https://github.com/user-attachments/assets/5c29ebb9-1efd-4f6c-8a15-cc4a867ccafd
 ### 1. Clone the Repository
 Open your terminal and download the project files :
 ```bash
-git clone https://github.com/mhradhika/5GTrial.git
-cd 5GTrial
-cd 5G_Digital_Twin
+git clone https://github.com/mhradhika/5GWireless/5G_Digital_Twin.git
+
 ```
 
 ### 2. Run the Installer
 ```bash
-chmod +x install.sh
+
 ./install.sh
 ```
 On startup you will see:  
