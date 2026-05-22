@@ -32,9 +32,8 @@ The platform is structured into five layers:
 ---
 
 ##  Quick Start Instructions
-### How to install : 
-
-https://github.com/user-attachments/assets/f8bad5d2-0e23-4876-a46a-2a055a76bd18
+### How to install :  
+https://github.com/user-attachments/assets/5c29ebb9-1efd-4f6c-8a15-cc4a867ccafd  
 ### 1. Clone the Repository
 Open your terminal and download the project files :
 ```bash
