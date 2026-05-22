@@ -32,12 +32,9 @@ The platform is structured into five layers:
 ---
 
 ##  Quick Start Instructions
-### 📺 Project Demo
-video: [Download/View Video]()
+### How to install : 
 
-<video src="" width="100%" controls></video>
-Follow these steps to get the dashboard running:
-
+https://github.com/user-attachments/assets/f8bad5d2-0e23-4876-a46a-2a055a76bd18
 ### 1. Clone the Repository
 Open your terminal and download the project files :
 ```bash
